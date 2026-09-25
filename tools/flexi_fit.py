@@ -214,6 +214,71 @@ def ncc(a, b, m, k, floor):
     return r, use
 
 
+def blur3d(g, n, sigma):
+    """separable gaussian over the (n,n,n) lattice, g flat"""
+    import torch
+    if sigma <= 0:
+        return g
+    r = max(1, int(3 * sigma))
+    k = torch.exp(-0.5 * (torch.arange(-r, r + 1, device=g.device, dtype=g.dtype) / sigma) ** 2)
+    k = k / k.sum()
+    x = g.view(1, 1, n, n, n)
+    for dim in range(3):
+        shape = [1, 1, 1, 1, 1]
+        shape[2 + dim] = -1
+        pad = [0, 0, 0, 0, 0, 0]
+        pad[2 * (2 - dim)] = pad[2 * (2 - dim) + 1] = r
+        x = torch.nn.functional.conv3d(torch.nn.functional.pad(x, pad, mode="replicate"), k.view(shape))
+    return x.reshape(-1)
+
+
+def laplacian_band(sdf, n, band):
+    """squared 6-neighbour Laplacian of the field near its zero set: bends
+    in the surface cost, flat and gently curved regions are free"""
+    s3 = sdf.view(n, n, n)
+    c = s3[1:-1, 1:-1, 1:-1]
+    lap = (s3[2:, 1:-1, 1:-1] + s3[:-2, 1:-1, 1:-1] + s3[1:-1, 2:, 1:-1] + s3[1:-1, :-2, 1:-1]
+           + s3[1:-1, 1:-1, 2:] + s3[1:-1, 1:-1, :-2] - 6 * c)
+    m = c.detach().abs() < band
+    return lap[m].pow(2).mean() if m.any() else sdf.sum() * 0
+
+
+class SmoothStep:
+    """The field's optimiser. Adam scales every grid value's step by that
+    value's own gradient history, so a vertex whose only gradient is the
+    faint noise of a regulariser still moves a full learning rate each step:
+    900 such steps grew the silhouette-only cat a skin of pimples wherever
+    no view constrained the surface. Here the gradient is blurred over the
+    lattice (neighbouring values move together: Large Steps for a grid),
+    limited to a band around the surface, and then normalised by one RMS
+    for the whole band, so strong signals move the surface and faint ones
+    barely do. Momentum as in Adam."""
+
+    def __init__(self, p, n, lr, sigma, band, b1=0.9, b2=0.99):
+        import torch
+        self.p, self.n, self.lr, self.sigma, self.band = p, n, lr, sigma, band
+        self.b1, self.b2, self.t = b1, b2, 0
+        self.m = torch.zeros_like(p)
+        self.v = 0.0
+
+    def step(self):
+        import torch
+        with torch.no_grad():
+            g = self.p.grad
+            if g is None:
+                return
+            g = blur3d(g, self.n, self.sigma)
+            near = blur3d((self.p.abs() < self.band).float(), self.n, 1.0) > 0.01
+            g = g * near
+            self.t += 1
+            self.m.mul_(self.b1).add_(g, alpha=1 - self.b1)
+            ms = g[near].pow(2).mean().item() if near.any() else 0.0
+            self.v = self.b2 * self.v + (1 - self.b2) * ms
+            mh = self.m / (1 - self.b1 ** self.t)
+            vh = self.v / (1 - self.b2 ** self.t)
+            self.p.sub_(self.lr * mh / (vh ** 0.5 + 1e-12))
+
+
 def sdf_reg(sdf, edges):
     """FlexiCubes/nvdiffrec: sign changes along grid edges cost a BCE, which
     removes floaters and interior sheets no view can see"""
@@ -258,13 +323,18 @@ def main():
     ap.add_argument("--stages", default="96:300,144:300,192:300", help="grid:steps, coarse to fine")
     ap.add_argument("--kofn", type=int, default=0, help="views allowed to dissent in the initial hull")
     ap.add_argument("--hull-margin", type=float, default=1.0, help="px the initial hull is grown by")
-    ap.add_argument("--lr", type=float, default=0.02, help="sdf step, voxels")
+    ap.add_argument("--lr", type=float, default=0.03, help="sdf step, voxels (RMS over the band)")
+    ap.add_argument("--grad-sigma", type=float, default=2.0, help="gradient blur on the lattice, voxels")
+    ap.add_argument("--band", type=float, default=3.0, help="only grid values this near the surface move")
+    ap.add_argument("--w-lap", type=float, default=0.05, help="Laplacian of the field near the surface")
+    ap.add_argument("--lr-local", type=float, default=0.005, help="FlexiCubes weights and deformation")
     ap.add_argument("--w-mask", type=float, default=1.0)
     ap.add_argument("--w-depth", type=float, default=1.0)
     ap.add_argument("--depth-huber", type=float, default=2.0, help="voxels")
     ap.add_argument("--depth-decay", type=float, default=0.3,
                     help="depth weight at the end, as a fraction of its start (guides, then yields)")
-    ap.add_argument("--w-photo", type=float, default=0.5)
+    ap.add_argument("--w-photo", type=float, default=0.1)
+    ap.add_argument("--photo-start", type=int, default=1, help="first stage with the photo term")
     ap.add_argument("--photo-patch", type=int, default=9)
     ap.add_argument("--photo-floor", type=float, default=0.02, help="min patch std (0-1 grey)")
     ap.add_argument("--photo-blur", default="3,2,1", help="grey image blur per stage, px")
@@ -359,8 +429,8 @@ def main():
         weight = torch.nn.Parameter(torch.zeros(len(cubes), 21, device=dev))
         deform = torch.nn.Parameter(torch.zeros_like(X))
         edges = torch.unique(torch.sort(cubes[:, fc.cube_edges].reshape(-1, 2), 1).values, dim=0)
-        opt = torch.optim.Adam([{"params": [sdf], "lr": a.lr},
-                                {"params": [weight, deform], "lr": a.lr / 2}])
+        opt = torch.optim.Adam([weight, deform], lr=a.lr_local)
+        sopt = SmoothStep(sdf, R + 1, a.lr, a.grad_sigma, a.band)
         sig = blurs[min(si, len(blurs) - 1)]
         g_img = torch.tensor(np.stack([ndimage.gaussian_filter(g, sig) if sig > 0 else g for g in grey]),
                              device=dev)
@@ -368,6 +438,7 @@ def main():
               f"[{time.time()-t0:.0f}s]", flush=True)
         for it in range(steps):
             opt.zero_grad()
+            sdf.grad = None
             t = step / max(total - 1, 1)
             gv = X + (0.5 - 1e-6) / R * torch.tanh(deform)
             v, f, L_dev = fc(gv * size + centre, sdf, cubes, R, beta_fx12=weight[:, :12],
@@ -395,7 +466,7 @@ def main():
                 wd = a.w_depth * (1 - (1 - a.depth_decay) * t)
                 loss = loss + wd * l_depth
             l_photo = torch.zeros((), device=dev)
-            if a.w_photo > 0 and pairs:
+            if a.w_photo > 0 and pairs and si >= a.photo_start:
                 sel = [pairs[q] for q in torch.randperm(len(pairs))[:a.photo_pairs].tolist()]
                 parts = []
                 for i, j in sel:
@@ -421,8 +492,11 @@ def main():
                 a.w_weight * weight[:, :20].abs().mean()
             l_nc = normal_consistency(v, f) if a.w_nc > 0 else torch.zeros((), device=dev)
             loss = loss + a.w_nc * l_nc
+            l_lap = laplacian_band(sdf, R + 1, 2.0) if a.w_lap > 0 else torch.zeros((), device=dev)
+            loss = loss + a.w_lap * l_lap
             loss.backward()
             opt.step()
+            sopt.step()
             with torch.no_grad():
                 iou = ((alpha > 0.5) & (tgt_a > 0.5)).sum().item() / max(((alpha > 0.5) | (tgt_a > 0.5)).sum().item(), 1)
             rec = {"step": step, "stage": si, "grid": R, "mask": l_mask.item(), "depth_vox": l_depth.item(),
