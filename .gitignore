@@ -1,0 +1,5 @@
+__pycache__/
+data/_kaggle/
+data/*.log
+data/*/da3/
+data/*/fit*/
